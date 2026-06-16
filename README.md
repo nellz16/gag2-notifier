@@ -1,65 +1,81 @@
-# GAG2 Telegram Stock Bot v5
+# GAG2 Telegram Stock Bot
 
-Production bot for Grow A Garden 2 stock notifications using Polar Supabase as upstream.
+Telegram bot for Grow A Garden 2 stock notifications using Polar Supabase as upstream.
 
-## What changed in v5
+## Features
 
-- Watchlist is now saved with `upsert`, not `update`, so the row is created even if the first `/start` DB upsert silently failed.
-- Callback button errors are shown as Telegram alert instead of being hidden in logs.
-- Added diagnostic commands:
-  - `/diag` checks DB + channel access.
-  - `/testdb` creates/updates your user row and tests watchlist saving.
-  - `/testchannel` sends a test message to the configured Telegram channel.
-  - `/forcechannel` sends the current stock to the channel even if the hash did not change.
-  - `/resetstate` resets saved stock hash.
-- Health endpoint now exposes last DB/channel errors.
-- Schema includes explicit grants for `service_role`.
+- Sends every stock update to a Telegram channel.
+- Users can subscribe privately to selected items.
+- Private notifications copy the exact channel message via Telegram `copyMessage`.
+- Supabase Realtime first, smart REST fallback at 5-minute mark + delay.
+- Uses your own Supabase project for user watchlists and bot state.
 
-## Required Koyeb env
+## Files
 
-```env
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHANNEL_ID=@your_public_channel_or_-100xxxxxxxxxx
-TELEGRAM_CHANNEL_URL=https://t.me/your_public_channel
+- `src/index.js` - main bot code
+- `package.json` - dependencies
+- `Dockerfile` - Koyeb deployment (uses npm install without package-lock)
+- `schema.sql` - tables for your own Supabase project
+- `.env.example` - environment variable template
 
-POLAR_SUPABASE_URL=https://xcxciixqhmghitmyigbj.supabase.co
-POLAR_SUPABASE_ANON=...
+## Deploy summary
 
-BOT_SUPABASE_URL=https://your-project.supabase.co
-BOT_SUPABASE_SERVICE_ROLE=...
+1. Create Telegram bot via BotFather.
+2. Create Telegram channel and add bot as admin.
+3. Create your own Supabase project and run `schema.sql`.
+4. Push this repo to GitHub.
+5. Deploy GitHub repo to Koyeb as a Web Service.
+6. Add all environment variables from `.env.example`.
 
-PORT=8000
-REST_FALLBACK_ENABLED=1
-REST_FALLBACK_DELAY_SECONDS=30
-FALLBACK_EXTRA_RETRY_SECONDS=
-SEND_INITIAL_TO_CHANNEL=0
-PRIVATE_MATCH_HEADER=0
-NOTIFY_DELAY_MS=80
-BOT_BRAND=GAG2 Stock Bot
-KNOWN_ITEMS=dragon fruit,mushroom,green bean,banana,grape,coconut,mango,sunflower,venus fly trap,pomegranate,poison apple,moon bloom,dragon's breath,thorn rose,glow mushroom,horned melon
-```
+## Commands
 
-## Supabase setup
+- `/start` - register and show help
+- `/watch` - choose item from buttons
+- `/add dragon fruit` - add item manually
+- `/remove` - remove item via buttons
+- `/list` - show watchlist
+- `/clear` - clear watchlist
+- `/now` - show current stock
+- `/stats` - bot status
 
-Run `schema.sql` in your own Supabase project. Use the **service_role** key from this project for `BOT_SUPABASE_SERVICE_ROLE`. Do not use the anon key here.
 
-## Telegram channel setup
+## Fix notes
 
-- Public channel: `TELEGRAM_CHANNEL_ID=@channelusername`
-- Private channel: `TELEGRAM_CHANNEL_ID=-100xxxxxxxxxx`
-- Add the bot as channel admin with permission to post messages.
+This version removes the `express` dependency and uses Node.js built-in `http` for `/` and `/healthz`. It also removes `package-lock.json` to avoid registry lock issues during Koyeb builds.
 
-After deployment, test in private chat with the bot:
 
-```txt
-/testdb
-/testchannel
-/forcechannel
-/watch
-/list
-/diag
-```
+## Runtime note
 
-## Koyeb
+This version pins Docker to Node.js 22 and also installs `ws` as an explicit Supabase Realtime transport, so it works on both Node 20 and Node 22+ runtimes.
 
-Use Dockerfile deployment. Exposed port should be `8000`, health path `/healthz`.
+
+## Koyeb port note
+
+Versi v4 listen di port `8000`, `3000`, dan `process.env.PORT` sekaligus agar health check Koyeb tidak gagal karena mismatch port. Di Koyeb tetap disarankan set Exposed Port ke `8000` dan Health Check HTTP path `/healthz`.
+
+
+## v6 fixes
+
+- Fails fast if `BOT_SUPABASE_SERVICE_ROLE` is accidentally filled with an anon/public key.
+- Accepts either legacy `service_role` or new `sb_secret_...` key for the bot database.
+- Fixes smart fallback scheduling so it can still run in the current 5-minute block when the +delay target has not passed.
+- `/diag`, `/stats`, and `/healthz` show the next fallback time.
+
+## Fix RLS error on /testdb
+
+If `/testdb` returns `new row violates row-level security policy`, your Koyeb env `BOT_SUPABASE_SERVICE_ROLE` is wrong.
+
+Use ONE of these for `BOT_SUPABASE_SERVICE_ROLE`:
+
+- Supabase `Legacy service_role` key from your own bot database project, OR
+- Supabase new `Secret key` (`sb_secret_...`) from your own bot database project.
+
+Do NOT use:
+
+- Legacy `anon public` key
+- New `sb_publishable_...` key
+- Polar anon key
+
+`POLAR_SUPABASE_ANON` and `BOT_SUPABASE_SERVICE_ROLE` are different keys for different projects.
+
+After changing env, redeploy Koyeb and run `/testdb` again.

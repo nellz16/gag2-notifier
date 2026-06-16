@@ -17,7 +17,8 @@ const CONFIG = {
   POLAR_SUPABASE_ANON: env.POLAR_SUPABASE_ANON,
 
   BOT_SUPABASE_URL: env.BOT_SUPABASE_URL,
-  BOT_SUPABASE_SERVICE_ROLE: env.BOT_SUPABASE_SERVICE_ROLE,
+  // Accept both old env name and newer Supabase Secret key env name.
+  BOT_SUPABASE_SERVICE_ROLE: env.BOT_SUPABASE_SERVICE_ROLE || env.BOT_SUPABASE_SECRET_KEY,
 
   REST_FALLBACK_ENABLED: env.REST_FALLBACK_ENABLED !== "0",
   REST_FALLBACK_DELAY_SECONDS: Number(env.REST_FALLBACK_DELAY_SECONDS || 30),
@@ -34,6 +35,50 @@ const CONFIG = {
   KNOWN_ITEMS: env.KNOWN_ITEMS || "",
 };
 
+function decodeJwtPayload(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length !== 3) return null;
+    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function validateSupabaseBotKey() {
+  const key = CONFIG.BOT_SUPABASE_SERVICE_ROLE;
+  const polarKey = CONFIG.POLAR_SUPABASE_ANON;
+
+  if (key === polarKey) {
+    throw new Error(
+      "BOT_SUPABASE_SERVICE_ROLE is identical to POLAR_SUPABASE_ANON. " +
+      "This is wrong. Use your OWN Supabase project service_role key or new sb_secret_ key for BOT_SUPABASE_SERVICE_ROLE."
+    );
+  }
+
+  if (String(key).startsWith("sb_publishable_")) {
+    throw new Error(
+      "BOT_SUPABASE_SERVICE_ROLE contains a publishable key. " +
+      "Use a Secret key (sb_secret_...) or legacy service_role key instead."
+    );
+  }
+
+  const payload = decodeJwtPayload(key);
+  if (payload?.role === "anon") {
+    throw new Error(
+      "BOT_SUPABASE_SERVICE_ROLE contains an anon/public key. " +
+      "Anon keys cannot bypass RLS, so tg_users inserts will fail. " +
+      "Use the legacy service_role key or the new Supabase Secret key in Koyeb env."
+    );
+  }
+
+  if (payload?.role && payload.role !== "service_role") {
+    log(`Warning: BOT_SUPABASE_SERVICE_ROLE JWT role is ${payload.role}, expected service_role.`);
+  }
+}
+
 for (const key of [
   "TELEGRAM_BOT_TOKEN",
   "TELEGRAM_CHANNEL_ID",
@@ -43,6 +88,8 @@ for (const key of [
 ]) {
   if (!CONFIG[key]) throw new Error(`Missing required env: ${key}`);
 }
+
+validateSupabaseBotKey();
 
 const bot = new Telegraf(CONFIG.TELEGRAM_BOT_TOKEN);
 
@@ -82,6 +129,7 @@ let appStartedAt = new Date().toISOString();
 let lastDbError = null;
 let lastChannelError = null;
 let lastChannelOkAt = null;
+let nextFallbackAt = null;
 
 function healthHandler(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -103,6 +151,7 @@ function healthHandler(req, res) {
               last_channel_error: lastChannelError,
               last_channel_ok_at: lastChannelOkAt,
               listening_ports: Array.from(listeningPorts),
+              next_fallback_at: nextFallbackAt,
             },
             null,
             2
@@ -272,6 +321,7 @@ bot.command("stats", async (ctx) => {
       `Latest items: <code>${latestItems.length}</code>`,
       `Users: <code>${userCount}</code>`,
       `Last processed: <code>${escapeHtml(lastProcessedAt || "-")}</code>`,
+      `Next fallback: <code>${escapeHtml(nextFallbackAt || "-")}</code>`,
     ].join("\n"),
     { parse_mode: "HTML" }
   );
@@ -291,6 +341,7 @@ bot.command("diag", async (ctx) => {
       `Channel ID: <code>${escapeHtml(CONFIG.TELEGRAM_CHANNEL_ID)}</code>`,
       `Realtime: <code>${escapeHtml(realtimeStatus)}</code>`,
       `Latest stock: <code>${escapeHtml(latestStock?.updated_at || "-")}</code>`,
+      `Next fallback: <code>${escapeHtml(nextFallbackAt || "-")}</code>`,
       `Last DB error: <code>${escapeHtml(lastDbError || "-")}</code>`,
       `Last Channel error: <code>${escapeHtml(lastChannelError || "-")}</code>`,
     ].join("\n"),
@@ -480,8 +531,10 @@ function subscribePolarRealtime() {
 }
 
 function scheduleSmartFallback() {
-  const baseMs = msUntilNextFiveMinutePlusDelay(CONFIG.REST_FALLBACK_DELAY_SECONDS);
-  log(`Next fallback REST in ${Math.round(baseMs / 1000)}s`);
+  const target = nextFiveMinutePlusDelayDate(CONFIG.REST_FALLBACK_DELAY_SECONDS);
+  const baseMs = Math.max(1000, target.getTime() - Date.now());
+  nextFallbackAt = target.toISOString();
+  log(`Next fallback REST at ${nextFallbackAt} in ${Math.round(baseMs / 1000)}s`);
 
   setTimeout(async () => {
     await runFallbackFetch("smart-fallback");
@@ -930,25 +983,29 @@ async function setState(key, value) {
   }
 }
 
-function msUntilNextFiveMinutePlusDelay(delaySeconds) {
+function nextFiveMinutePlusDelayDate(delaySeconds) {
   const now = new Date();
-  const next = new Date(now);
+  const delay = Math.max(0, Math.min(240, Number(delaySeconds) || 30));
 
-  next.setMilliseconds(0);
-  next.setSeconds(delaySeconds);
+  // Build candidates for the current 5-minute block and following blocks.
+  // This prevents skipping the current cycle when the bot starts at e.g. 20:10:12
+  // and the target 20:10:30 has not passed yet.
+  const currentBlockMinute = Math.floor(now.getMinutes() / 5) * 5;
 
-  const minute = now.getMinutes();
-  const baseMinute = Math.ceil((minute + 0.000001) / 5) * 5;
+  for (let i = 0; i < 24; i++) {
+    const candidate = new Date(now);
+    candidate.setMilliseconds(0);
+    candidate.setSeconds(delay);
+    candidate.setMinutes(currentBlockMinute + i * 5);
 
-  if (baseMinute >= 60) {
-    next.setHours(next.getHours() + 1);
-    next.setMinutes(0);
-  } else {
-    next.setMinutes(baseMinute);
+    if (candidate > now) return candidate;
   }
 
-  if (next <= now) next.setMinutes(next.getMinutes() + 5);
-  return next.getTime() - now.getTime();
+  const fallback = new Date(now.getTime() + 5 * 60 * 1000);
+  fallback.setMilliseconds(0);
+  fallback.setSeconds(delay);
+  fallback.setMinutes(Math.ceil(fallback.getMinutes() / 5) * 5);
+  return fallback;
 }
 
 async function testDbRoundtrip(chatId) {
