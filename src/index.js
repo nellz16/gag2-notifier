@@ -130,6 +130,7 @@ let lastDbError = null;
 let lastChannelError = null;
 let lastChannelOkAt = null;
 let nextFallbackAt = null;
+let botLaunchStatus = "not-started";
 
 function healthHandler(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -152,6 +153,8 @@ function healthHandler(req, res) {
               last_channel_ok_at: lastChannelOkAt,
               listening_ports: Array.from(listeningPorts),
               next_fallback_at: nextFallbackAt,
+              bot_launch_status: botLaunchStatus,
+              rest_fallback_enabled: CONFIG.REST_FALLBACK_ENABLED,
             },
             null,
             2
@@ -316,6 +319,7 @@ bot.command("stats", async (ctx) => {
   await ctx.reply(
     [
       `📊 <b>${escapeHtml(CONFIG.BOT_BRAND)} Stats</b>`,
+      `Telegram launch: <code>${escapeHtml(botLaunchStatus)}</code>`,
       `Realtime: <code>${escapeHtml(realtimeStatus)}</code>`,
       `Latest stock: <code>${escapeHtml(latestStock?.updated_at || "-")}</code>`,
       `Latest items: <code>${latestItems.length}</code>`,
@@ -339,6 +343,7 @@ bot.command("diag", async (ctx) => {
       `DB: <code>${dbOk ? "OK" : "ERROR"}</code>`,
       `Channel: <code>${channelOk ? "OK" : "ERROR"}</code>`,
       `Channel ID: <code>${escapeHtml(CONFIG.TELEGRAM_CHANNEL_ID)}</code>`,
+      `Telegram launch: <code>${escapeHtml(botLaunchStatus)}</code>`,
       `Realtime: <code>${escapeHtml(realtimeStatus)}</code>`,
       `Latest stock: <code>${escapeHtml(latestStock?.updated_at || "-")}</code>`,
       `Next fallback: <code>${escapeHtml(nextFallbackAt || "-")}</code>`,
@@ -379,6 +384,18 @@ bot.command("forcechannel", async (ctx) => {
     await ctx.reply("✅ Stock sekarang dipaksa kirim ke channel.");
   } catch (err) {
     await ctx.reply(`❌ Force channel error: ${err.message}`);
+  }
+});
+
+
+bot.command("pollnow", async (ctx) => {
+  await upsertTelegramUser(ctx);
+  try {
+    const row = await fetchPolarStock();
+    const sent = await processStockUpdate(row, "manual-pollnow");
+    await ctx.reply(sent ? "✅ Ada perubahan. Update dikirim ke channel." : "ℹ️ Tidak ada perubahan hash. Tidak kirim ke channel.");
+  } catch (err) {
+    await ctx.reply(`❌ Poll now error: ${err.message}`);
   }
 });
 
@@ -457,14 +474,33 @@ bot.catch((err) => {
 async function main() {
   log("Starting bot...");
 
-  await bot.launch({ dropPendingUpdates: false });
-  log("Telegram bot launched");
+  // IMPORTANT:
+  // Do NOT await bot.launch() before starting background jobs.
+  // With Telegraf long polling, bot.launch() may keep the promise pending,
+  // which would prevent Realtime + fallback scheduler from ever starting.
+  botLaunchStatus = "starting";
+  const launchPromise = bot.launch({ dropPendingUpdates: false });
+  launchPromise
+    .then(() => {
+      botLaunchStatus = "launched";
+      log("Telegram bot launch promise resolved");
+    })
+    .catch((err) => {
+      botLaunchStatus = `error: ${err?.message || err}`;
+      console.error("Telegram launch error:", err);
+      process.exit(1);
+    });
 
+  log("Telegram bot launch requested");
+
+  // Start stock pipeline independently from Telegram long polling.
   await initializeStockState();
   subscribePolarRealtime();
 
   if (CONFIG.REST_FALLBACK_ENABLED) {
     scheduleSmartFallback();
+  } else {
+    log("REST fallback disabled by env REST_FALLBACK_ENABLED=0");
   }
 
   process.once("SIGINT", () => shutdown("SIGINT"));
@@ -581,7 +617,7 @@ async function processStockUpdate(row, reason, options = {}) {
   const savedHash = await getState("last_stock_hash");
 
   if (!options.force && savedHash === hash) {
-    log(`No change. reason=${reason}, updated_at=${row.updated_at}`);
+    log(`No change. reason=${reason}, updated_at=${row.updated_at}, hash=${hash.slice(0, 12)}`);
     return false;
   }
 
