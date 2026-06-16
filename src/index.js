@@ -79,6 +79,9 @@ let latestChannelMessageId = null;
 let realtimeStatus = "not-started";
 let lastProcessedAt = null;
 let appStartedAt = new Date().toISOString();
+let lastDbError = null;
+let lastChannelError = null;
+let lastChannelOkAt = null;
 
 function healthHandler(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -96,6 +99,9 @@ function healthHandler(req, res) {
               latest_updated_at: latestStock?.updated_at || null,
               latest_channel_message_id: latestChannelMessageId,
               latest_items_count: latestItems.length,
+              last_db_error: lastDbError,
+              last_channel_error: lastChannelError,
+              last_channel_ok_at: lastChannelOkAt,
               listening_ports: Array.from(listeningPorts),
             },
             null,
@@ -207,7 +213,7 @@ bot.command("add", async (ctx) => {
     return ctx.reply("Format: /add nama item\nContoh: /add dragon fruit");
   }
 
-  const watch = await getWatchlist(String(ctx.chat.id));
+  const watch = await getWatchlist(getCtxChatId(ctx));
   const key = `keyword:${slugify(keyword)}`;
   const exists = watch.some((x) => x.key === key);
 
@@ -225,7 +231,7 @@ bot.command("add", async (ctx) => {
     },
   ];
 
-  await setWatchlist(String(ctx.chat.id), next);
+  await setWatchlist(getCtxChatId(ctx), next);
   await ctx.reply(`✅ Ditambahkan ke watchlist: ${titleCase(keyword)}`);
 });
 
@@ -237,7 +243,7 @@ bot.command("remove", async (ctx) => {
 bot.command("list", async (ctx) => {
   await upsertTelegramUser(ctx);
 
-  const watch = await getWatchlist(String(ctx.chat.id));
+  const watch = await getWatchlist(getCtxChatId(ctx));
   if (!watch.length) {
     return ctx.reply("Watchlist kamu masih kosong. Pakai /watch atau /add nama item.");
   }
@@ -250,7 +256,7 @@ bot.command("list", async (ctx) => {
 
 bot.command("clear", async (ctx) => {
   await upsertTelegramUser(ctx);
-  await setWatchlist(String(ctx.chat.id), []);
+  await setWatchlist(getCtxChatId(ctx), []);
   await ctx.reply("✅ Watchlist sudah dikosongkan.");
 });
 
@@ -271,6 +277,72 @@ bot.command("stats", async (ctx) => {
   );
 });
 
+bot.command("diag", async (ctx) => {
+  await upsertTelegramUser(ctx);
+
+  const dbOk = await testDbRoundtrip(getCtxChatId(ctx)).then(() => true).catch(() => false);
+  const channelOk = await testChannelAccess(false).then(() => true).catch(() => false);
+
+  await ctx.reply(
+    [
+      `🧪 <b>Diagnostic</b>`,
+      `DB: <code>${dbOk ? "OK" : "ERROR"}</code>`,
+      `Channel: <code>${channelOk ? "OK" : "ERROR"}</code>`,
+      `Channel ID: <code>${escapeHtml(CONFIG.TELEGRAM_CHANNEL_ID)}</code>`,
+      `Realtime: <code>${escapeHtml(realtimeStatus)}</code>`,
+      `Latest stock: <code>${escapeHtml(latestStock?.updated_at || "-")}</code>`,
+      `Last DB error: <code>${escapeHtml(lastDbError || "-")}</code>`,
+      `Last Channel error: <code>${escapeHtml(lastChannelError || "-")}</code>`,
+    ].join("\n"),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.command("testdb", async (ctx) => {
+  await upsertTelegramUser(ctx);
+  try {
+    await testDbRoundtrip(getCtxChatId(ctx));
+    await ctx.reply("✅ DB Supabase bot OK. Row user berhasil dibuat/diupdate.");
+  } catch (err) {
+    await ctx.reply(`❌ DB error: ${err.message}`);
+  }
+});
+
+bot.command("testchannel", async (ctx) => {
+  await upsertTelegramUser(ctx);
+  try {
+    const sent = await testChannelAccess(true);
+    await ctx.reply(`✅ Channel OK. Test message_id: ${sent.message_id}`);
+  } catch (err) {
+    await ctx.reply(`❌ Channel error: ${err.message}
+
+Pastikan bot jadi admin channel dan TELEGRAM_CHANNEL_ID benar.`);
+  }
+});
+
+bot.command("forcechannel", async (ctx) => {
+  await upsertTelegramUser(ctx);
+  try {
+    const row = await fetchPolarStock();
+    await processStockUpdate(row, "manual-force", { force: true });
+    await ctx.reply("✅ Stock sekarang dipaksa kirim ke channel.");
+  } catch (err) {
+    await ctx.reply(`❌ Force channel error: ${err.message}`);
+  }
+});
+
+bot.command("resetstate", async (ctx) => {
+  await upsertTelegramUser(ctx);
+  try {
+    await setState("last_stock_hash", null);
+    await setState("last_stock_updated_at", null);
+    await ctx.reply("✅ State hash direset. Update berikutnya akan dianggap baru.");
+  } catch (err) {
+    await ctx.reply(`❌ Reset state error: ${err.message}`);
+  }
+});
+
+
 bot.action(/^watch_page:(\d+)$/, async (ctx) => {
   await upsertTelegramUser(ctx);
   const page = Number(ctx.match[1] || 0);
@@ -279,40 +351,50 @@ bot.action(/^watch_page:(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^toggle:(.+)$/, async (ctx) => {
-  await upsertTelegramUser(ctx);
+  try {
+    await upsertTelegramUser(ctx);
 
-  const chatId = String(ctx.chat.id);
-  const key = ctx.match[1];
-  const item = getSelectableItems().find((x) => x.key === key);
+    const chatId = getCtxChatId(ctx);
+    const key = ctx.match[1];
+    const item = getSelectableItems().find((x) => x.key === key);
 
-  if (!item) {
-    await ctx.answerCbQuery("Item tidak ditemukan.");
-    return;
+    if (!item) {
+      await ctx.answerCbQuery("Item tidak ditemukan.", { show_alert: true });
+      return;
+    }
+
+    const watch = await getWatchlist(chatId);
+    const exists = watch.some((x) => x.key === item.key);
+    const next = exists ? watch.filter((x) => x.key !== item.key) : [...watch, itemToWatchEntry(item)];
+
+    await setWatchlist(chatId, next, ctx);
+    await ctx.answerCbQuery(exists ? `Dihapus: ${item.label}` : `Ditambahkan: ${item.label}`);
+
+    const page = Number(ctx.callbackQuery?.message?.reply_markup?.inline_keyboard?.at(-1)?.[0]?.callback_data?.match(/watch_page:(\d+)/)?.[1] || 0);
+    await sendWatchMenu(ctx, page, true);
+  } catch (err) {
+    console.error("toggle action error:", err);
+    try { await ctx.answerCbQuery(`Error: ${String(err.message || err).slice(0, 180)}`, { show_alert: true }); } catch {}
   }
-
-  const watch = await getWatchlist(chatId);
-  const exists = watch.some((x) => x.key === item.key);
-  const next = exists ? watch.filter((x) => x.key !== item.key) : [...watch, itemToWatchEntry(item)];
-
-  await setWatchlist(chatId, next);
-  await ctx.answerCbQuery(exists ? `Dihapus: ${item.label}` : `Ditambahkan: ${item.label}`);
-
-  const page = Number(ctx.callbackQuery?.message?.reply_markup?.inline_keyboard?.at(-1)?.[0]?.callback_data?.match(/watch_page:(\d+)/)?.[1] || 0);
-  await sendWatchMenu(ctx, page, true);
 });
 
 bot.action(/^remove:(.+)$/, async (ctx) => {
-  await upsertTelegramUser(ctx);
+  try {
+    await upsertTelegramUser(ctx);
 
-  const chatId = String(ctx.chat.id);
-  const key = ctx.match[1];
-  const watch = await getWatchlist(chatId);
-  const removed = watch.find((x) => x.key === key);
-  const next = watch.filter((x) => x.key !== key);
+    const chatId = getCtxChatId(ctx);
+    const key = ctx.match[1];
+    const watch = await getWatchlist(chatId);
+    const removed = watch.find((x) => x.key === key);
+    const next = watch.filter((x) => x.key !== key);
 
-  await setWatchlist(chatId, next);
-  await ctx.answerCbQuery(removed ? `Dihapus: ${removed.label}` : "Dihapus");
-  await sendRemoveMenu(ctx, true);
+    await setWatchlist(chatId, next, ctx);
+    await ctx.answerCbQuery(removed ? `Dihapus: ${removed.label}` : "Dihapus");
+    await sendRemoveMenu(ctx, true);
+  } catch (err) {
+    console.error("remove action error:", err);
+    try { await ctx.answerCbQuery(`Error: ${String(err.message || err).slice(0, 180)}`, { show_alert: true }); } catch {}
+  }
 });
 
 bot.action("noop", async (ctx) => ctx.answerCbQuery());
@@ -438,14 +520,14 @@ async function fetchPolarStock() {
   return data;
 }
 
-async function processStockUpdate(row, reason) {
+async function processStockUpdate(row, reason, options = {}) {
   latestStock = row;
   latestItems = normalizeItems(row);
 
   const hash = makeStockHash(row);
   const savedHash = await getState("last_stock_hash");
 
-  if (savedHash === hash) {
+  if (!options.force && savedHash === hash) {
     log(`No change. reason=${reason}, updated_at=${row.updated_at}`);
     return false;
   }
@@ -456,10 +538,19 @@ async function processStockUpdate(row, reason) {
 
   const text = formatStockMessage(row, reason);
 
-  const sent = await bot.telegram.sendMessage(CONFIG.TELEGRAM_CHANNEL_ID, text, {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
+  let sent;
+  try {
+    sent = await bot.telegram.sendMessage(CONFIG.TELEGRAM_CHANNEL_ID, text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+    lastChannelError = null;
+    lastChannelOkAt = new Date().toISOString();
+  } catch (err) {
+    lastChannelError = `${err?.description || err?.message || err}`;
+    console.error("Channel send error:", err);
+    throw new Error(`Channel send failed: ${lastChannelError}`);
+  }
 
   latestChannelMessageId = sent.message_id;
   log(`Sent channel update. message_id=${sent.message_id}, reason=${reason}`);
@@ -539,7 +630,7 @@ function findMatches(watchlist, currentItems) {
 }
 
 async function sendWatchMenu(ctx, page = 0, edit = false) {
-  const chatId = String(ctx.chat.id);
+  const chatId = getCtxChatId(ctx);
   const watch = await getWatchlist(chatId);
   const selected = new Set(watch.map((x) => x.key));
 
@@ -589,7 +680,7 @@ async function sendWatchMenu(ctx, page = 0, edit = false) {
 }
 
 async function sendRemoveMenu(ctx, edit = false) {
-  const chatId = String(ctx.chat.id);
+  const chatId = getCtxChatId(ctx);
   const watch = await getWatchlist(chatId);
 
   if (!watch.length) {
@@ -736,38 +827,84 @@ function makeStockHash(row) {
 
 async function upsertTelegramUser(ctx) {
   const from = ctx.from;
-  const chat = ctx.chat;
-  if (!from || !chat || chat.type !== "private") return;
+  const chatId = getCtxChatId(ctx);
+  if (!from || !chatId) return null;
 
   const payload = {
-    chat_id: String(chat.id),
+    chat_id: String(chatId),
     username: from.username || null,
     first_name: from.first_name || null,
     updated_at: new Date().toISOString(),
   };
 
-  const { error } = await db.from("tg_users").upsert(payload, { onConflict: "chat_id" });
-  if (error) console.error("upsert user error:", error.message);
+  const { data, error } = await db
+    .from("tg_users")
+    .upsert(payload, { onConflict: "chat_id" })
+    .select("chat_id, watchlist")
+    .single();
+
+  if (error) {
+    lastDbError = `upsert user: ${error.message}`;
+    console.error("upsert user error:", error);
+    return null;
+  }
+
+  lastDbError = null;
+  return data;
 }
 
 async function getWatchlist(chatId) {
-  const { data, error } = await db.from("tg_users").select("watchlist").eq("chat_id", String(chatId)).single();
-  if (error || !data) return [];
-  return Array.isArray(data.watchlist) ? data.watchlist : [];
+  const { data, error } = await db
+    .from("tg_users")
+    .select("watchlist")
+    .eq("chat_id", String(chatId))
+    .maybeSingle();
+
+  if (error) {
+    lastDbError = `getWatchlist: ${error.message}`;
+    console.error("getWatchlist error:", error);
+    return [];
+  }
+
+  lastDbError = null;
+  return Array.isArray(data?.watchlist) ? data.watchlist : [];
 }
 
-async function setWatchlist(chatId, watchlist) {
-  const { error } = await db
-    .from("tg_users")
-    .update({ watchlist, updated_at: new Date().toISOString() })
-    .eq("chat_id", String(chatId));
+async function setWatchlist(chatId, watchlist, ctx = null) {
+  const payload = {
+    chat_id: String(chatId),
+    watchlist: Array.isArray(watchlist) ? watchlist : [],
+    updated_at: new Date().toISOString(),
+  };
 
-  if (error) throw new Error(`setWatchlist error: ${error.message}`);
+  if (ctx?.from) {
+    payload.username = ctx.from.username || null;
+    payload.first_name = ctx.from.first_name || null;
+  }
+
+  const { data, error } = await db
+    .from("tg_users")
+    .upsert(payload, { onConflict: "chat_id" })
+    .select("chat_id, watchlist")
+    .single();
+
+  if (error) {
+    lastDbError = `setWatchlist: ${error.message}`;
+    console.error("setWatchlist error:", error);
+    throw new Error(`setWatchlist error: ${error.message}`);
+  }
+
+  lastDbError = null;
+  return data;
 }
 
 async function countUsers() {
   const { count, error } = await db.from("tg_users").select("chat_id", { count: "exact", head: true });
-  if (error) return 0;
+  if (error) {
+    lastDbError = `countUsers: ${error.message}`;
+    console.error("countUsers error:", error);
+    return 0;
+  }
   return count || 0;
 }
 
@@ -787,7 +924,10 @@ async function setState(key, value) {
     { onConflict: "key" }
   );
 
-  if (error) throw new Error(`setState error: ${error.message}`);
+  if (error) {
+    lastDbError = `setState: ${error.message}`;
+    throw new Error(`setState error: ${error.message}`);
+  }
 }
 
 function msUntilNextFiveMinutePlusDelay(delaySeconds) {
@@ -811,6 +951,43 @@ function msUntilNextFiveMinutePlusDelay(delaySeconds) {
   return next.getTime() - now.getTime();
 }
 
+async function testDbRoundtrip(chatId) {
+  const testEntry = {
+    key: "diagnostic:test",
+    mode: "keyword",
+    value: "diagnostic-test",
+    label: "Diagnostic Test",
+    hidden: true,
+  };
+
+  const current = await getWatchlist(chatId);
+  const withoutTest = current.filter((x) => x.key !== testEntry.key);
+  await setWatchlist(chatId, [...withoutTest, testEntry]);
+  await setWatchlist(chatId, withoutTest);
+  return true;
+}
+
+async function testChannelAccess(sendMessage = false) {
+  if (!sendMessage) {
+    await bot.telegram.getChat(CONFIG.TELEGRAM_CHANNEL_ID);
+    lastChannelError = null;
+    return true;
+  }
+
+  const sent = await bot.telegram.sendMessage(
+    CONFIG.TELEGRAM_CHANNEL_ID,
+    `✅ ${escapeHtml(CONFIG.BOT_BRAND)} channel test\n${escapeHtml(new Date().toISOString())}`,
+    { parse_mode: "HTML" }
+  );
+  lastChannelError = null;
+  lastChannelOkAt = new Date().toISOString();
+  return sent;
+}
+
+function getCtxChatId(ctx) {
+  return String(ctx?.chat?.id || ctx?.callbackQuery?.message?.chat?.id || ctx?.from?.id || "");
+}
+
 function helpText() {
   return [
     `🌱 <b>${escapeHtml(CONFIG.BOT_BRAND)}</b>`,
@@ -823,6 +1000,10 @@ function helpText() {
     "• /clear - hapus semua watchlist",
     "• /now - cek stock sekarang",
     "• /stats - status bot",
+    "• /diag - cek DB dan channel",
+    "• /testdb - test simpan watchlist",
+    "• /testchannel - test kirim ke channel",
+    "• /forcechannel - paksa kirim stock sekarang",
   ].join("\n");
 }
 
