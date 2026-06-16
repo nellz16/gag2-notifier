@@ -1,4 +1,4 @@
-import express from "express";
+import http from "node:http";
 import crypto from "crypto";
 import { Telegraf, Markup } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
@@ -11,7 +11,6 @@ const CONFIG = {
   TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHANNEL_ID: env.TELEGRAM_CHANNEL_ID,
   TELEGRAM_CHANNEL_URL: env.TELEGRAM_CHANNEL_URL || "",
-  BOT_OWNER_ID: env.BOT_OWNER_ID || "",
 
   POLAR_SUPABASE_URL: env.POLAR_SUPABASE_URL || "https://xcxciixqhmghitmyigbj.supabase.co",
   POLAR_SUPABASE_ANON: env.POLAR_SUPABASE_ANON,
@@ -74,26 +73,40 @@ let realtimeStatus = "not-started";
 let lastProcessedAt = null;
 let appStartedAt = new Date().toISOString();
 
-const app = express();
-app.use(express.json());
+const healthServer = http.createServer((req, res) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-app.get("/", (_req, res) => {
-  res.type("text/plain").send(`${CONFIG.BOT_BRAND} is running.`);
+  if (url.pathname === "/" || url.pathname === "/healthz") {
+    const payload =
+      url.pathname === "/"
+        ? `${CONFIG.BOT_BRAND} is running.\n`
+        : JSON.stringify(
+            {
+              ok: true,
+              started_at: appStartedAt,
+              realtime_status: realtimeStatus,
+              last_processed_at: lastProcessedAt,
+              latest_updated_at: latestStock?.updated_at || null,
+              latest_channel_message_id: latestChannelMessageId,
+              latest_items_count: latestItems.length,
+            },
+            null,
+            2
+          );
+
+    res.writeHead(200, {
+      "content-type": url.pathname === "/" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    });
+    res.end(payload);
+    return;
+  }
+
+  res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+  res.end("Not found\n");
 });
 
-app.get("/healthz", (_req, res) => {
-  res.json({
-    ok: true,
-    started_at: appStartedAt,
-    realtime_status: realtimeStatus,
-    last_processed_at: lastProcessedAt,
-    latest_updated_at: latestStock?.updated_at || null,
-    latest_channel_message_id: latestChannelMessageId,
-    latest_items_count: latestItems.length,
-  });
-});
-
-app.listen(CONFIG.PORT, () => {
+healthServer.listen(CONFIG.PORT, "0.0.0.0", () => {
   log(`Health server listening on port ${CONFIG.PORT}`);
 });
 
@@ -206,23 +219,6 @@ bot.command("clear", async (ctx) => {
   await upsertTelegramUser(ctx);
   await setWatchlist(String(ctx.chat.id), []);
   await ctx.reply("✅ Watchlist sudah dikosongkan.");
-});
-
-
-bot.command("testchannel", async (ctx) => {
-  await upsertTelegramUser(ctx);
-
-  if (CONFIG.BOT_OWNER_ID && String(ctx.from?.id) !== String(CONFIG.BOT_OWNER_ID)) {
-    return ctx.reply("❌ Perintah ini hanya untuk owner bot.");
-  }
-
-  const sent = await bot.telegram.sendMessage(
-    CONFIG.TELEGRAM_CHANNEL_ID,
-    `✅ <b>${escapeHtml(CONFIG.BOT_BRAND)}</b> channel test berhasil.`,
-    { parse_mode: "HTML" }
-  );
-
-  await ctx.reply(`✅ Test terkirim ke channel. message_id=${sent.message_id}`);
 });
 
 bot.command("stats", async (ctx) => {
@@ -793,7 +789,6 @@ function helpText() {
     "• /list - lihat watchlist",
     "• /clear - hapus semua watchlist",
     "• /now - cek stock sekarang",
-    "• /testchannel - test kirim ke channel",
     "• /stats - status bot",
   ].join("\n");
 }
