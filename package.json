@@ -1,0 +1,18 @@
+{
+  "name": "gag2-telegram-stock-bot",
+  "version": "1.0.0",
+  "description": "Telegram stock notifier for Grow A Garden 2 using Polar Supabase as upstream.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "express": "^4.19.2",
+    "telegraf": "^4.16.3"
+  }
+}
