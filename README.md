@@ -47,3 +47,8 @@ This version removes the `express` dependency and uses Node.js built-in `http` f
 ## Runtime note
 
 This version pins Docker to Node.js 22 and also installs `ws` as an explicit Supabase Realtime transport, so it works on both Node 20 and Node 22+ runtimes.
+
+
+## Koyeb port note
+
+Versi v4 listen di port `8000`, `3000`, dan `process.env.PORT` sekaligus agar health check Koyeb tidak gagal karena mismatch port. Di Koyeb tetap disarankan set Exposed Port ke `8000` dan Health Check HTTP path `/healthz`.

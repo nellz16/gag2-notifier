@@ -7,7 +7,7 @@ import WebSocket from "ws";
 const env = process.env;
 
 const CONFIG = {
-  PORT: Number(env.PORT || 3000),
+  PORT: Number(env.PORT || env.KOYEB_PORT || 8000),
 
   TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHANNEL_ID: env.TELEGRAM_CHANNEL_ID,
@@ -80,7 +80,7 @@ let realtimeStatus = "not-started";
 let lastProcessedAt = null;
 let appStartedAt = new Date().toISOString();
 
-const healthServer = http.createServer((req, res) => {
+function healthHandler(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
   if (url.pathname === "/" || url.pathname === "/healthz") {
@@ -96,6 +96,7 @@ const healthServer = http.createServer((req, res) => {
               latest_updated_at: latestStock?.updated_at || null,
               latest_channel_message_id: latestChannelMessageId,
               latest_items_count: latestItems.length,
+              listening_ports: Array.from(listeningPorts),
             },
             null,
             2
@@ -111,11 +112,36 @@ const healthServer = http.createServer((req, res) => {
 
   res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
   res.end("Not found\n");
-});
+}
 
-healthServer.listen(CONFIG.PORT, "0.0.0.0", () => {
-  log(`Health server listening on port ${CONFIG.PORT}`);
-});
+const listeningPorts = new Set();
+const healthServers = [];
+
+function startHealthServer(port) {
+  if (!Number.isInteger(port) || port <= 0 || listeningPorts.has(port)) return;
+
+  const server = http.createServer(healthHandler);
+
+  server.on("error", (err) => {
+    if (err?.code === "EADDRINUSE") {
+      log(`Health port ${port} already in use, skipping.`);
+      return;
+    }
+    console.error(`Health server error on port ${port}:`, err);
+  });
+
+  server.listen(port, "0.0.0.0", () => {
+    listeningPorts.add(port);
+    log(`Health server listening on port ${port}`);
+  });
+
+  healthServers.push(server);
+}
+
+// Koyeb often checks port 8000 by default. Some previous configs used 3000.
+// Listen on all likely ports so deployment does not fail only because of port mismatch.
+const healthPorts = [CONFIG.PORT, 8000, 3000];
+for (const port of healthPorts) startHealthServer(port);
 
 bot.start(async (ctx) => {
   await upsertTelegramUser(ctx);

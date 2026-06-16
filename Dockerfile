@@ -7,4 +7,6 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY . .
 
+EXPOSE 8000
+
 CMD ["npm", "start"]
