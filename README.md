@@ -42,3 +42,8 @@ Telegram bot for Grow A Garden 2 stock notifications using Polar Supabase as ups
 ## Fix notes
 
 This version removes the `express` dependency and uses Node.js built-in `http` for `/` and `/healthz`. It also removes `package-lock.json` to avoid registry lock issues during Koyeb builds.
+
+
+## Runtime note
+
+This version pins Docker to Node.js 22 and also installs `ws` as an explicit Supabase Realtime transport, so it works on both Node 20 and Node 22+ runtimes.

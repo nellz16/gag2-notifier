@@ -2,6 +2,7 @@ import http from "node:http";
 import crypto from "crypto";
 import { Telegraf, Markup } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
 
 const env = process.env;
 
@@ -52,6 +53,7 @@ const polar = createClient(CONFIG.POLAR_SUPABASE_URL, CONFIG.POLAR_SUPABASE_ANON
     detectSessionInUrl: false,
   },
   realtime: {
+    transport: WebSocket,
     params: {
       eventsPerSecond: 2,
     },
@@ -63,6 +65,11 @@ const db = createClient(CONFIG.BOT_SUPABASE_URL, CONFIG.BOT_SUPABASE_SERVICE_ROL
     persistSession: false,
     autoRefreshToken: false,
     detectSessionInUrl: false,
+  },
+  // Supabase JS still initializes a Realtime client internally.
+  // Node.js 20 needs an explicit WebSocket transport; harmless on Node 22+.
+  realtime: {
+    transport: WebSocket,
   },
 });
 
